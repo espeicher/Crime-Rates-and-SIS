@@ -1,0 +1,61 @@
+---
+title: "Toronto Crime Rates and SIS"
+author: "Edward Speicher"
+date: "17/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data Preparation
+
+```{r}
+#install.packages('caret')
+#install.packages('corrplot')
+#install.packages('pastecs')
+library(corrplot)
+library(caret)
+library(MASS)
+library(ggplot2)
+library(pastecs)
+setwd('/')
+
+demographics = read.csv('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/neighbourhood-profiles-2016-csv.csv', header = TRUE)
+
+crime = read.csv('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/Neighbourhood Crime Rates.csv', header = TRUE)
+
+```
+# The data in the demographic profiles dataframe needs to be transposed before it can be combined with the crime rate data based on the Neighbourhood ID. We can then remove the rows (1-4) pertaining to the original source of the data fields in the original dataframe. Row 5 can also be removed, since the data it contains has been captured as the column names, and row 6 can be removed as it contains demographic information pertaining to the city of Toronto as a whole.
+
+```{r}
+demographics = t(demographics)
+colnames(demographics) <- as.character(unlist(demographics[5,]))
+demographics <- demographics[-c(1,2,3,4,5,6),]
+```
+# Now we can merge our two dataframes
+```{r}
+crimedemo <- merge(crime, demographics, by.x=c("Hood_ID"), by.y=c("Neighbourhood Number"))
+```
+# Taking a preliminary look at the combined data
+
+```{r}
+head(crimedemo)
+summary(crimedemo)
+str(crimedemo)
+sum(is.na(crimedemo))
+sum(is.null(crimedemo))
+```
+#We can immediately remove the first three columns, as they are unique identifiers. We can also remove the information relating to neighbourhood geometry in columns 60-62, and the non predictive information in column 63. Finally, column 5 "Population" and column 64 "2016 Population" are duplicates, so I will remove column 5.
+```{r}
+crimedemo <- crimedemo[,-c(1,2,3,5,60,61,62,63)]
+```
+#There are no NA or null values, meaning we have a complete dataset.
+
+#Feature Selection
+
+#With such a large number of features stemming from the Census data, we need to look at the correlation between various types of crime and demographic information. We can choose a reasonable cut off, so that any feature that does not meet the threshold of correlation, say a cor value of 0.4, would not be included.
+```{r}
+#correlationsAssault = cor(crimedemo[-c(1)], crimedemo[2440])
+```
