@@ -1,0 +1,236 @@
+---
+title: "Toronto Crime Rates and SIS"
+author: "Edward Speicher"
+date: "17/10/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data Preparation
+
+```{r}
+#install.packages('caret')
+#install.packages('corrplot')
+#install.packages('pastecs')
+#install.packages('FSelectorRccp')
+#install.packages('rgeos')
+#install.packages('GISTools')
+#install.packages("arsenal")
+library(corrplot)
+library(caret)
+library(pastecs)
+library(dplyr)
+library(FSelectorRcpp)
+library(stats)
+library(rgeos)
+library(GISTools)
+library(ggplot2)
+library(arsena)
+library(sp)
+library(rpart)
+setwd('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/')
+
+demographics = read.csv('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/neighbourhood-profiles-2016-csv.csv', header = TRUE, stringsAsFactors = FALSE)
+
+NeighbourhoodCrime = read.csv('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/Neighbourhood Crime Rates.csv', header = TRUE)
+
+```
+# The data in the demographic profiles dataframe needs to be transposed before it can be combined with the crime rate data based on the Neighbourhood ID. We can then remove the rows (1-4) pertaining to the original source of the data fields in the original dataframe. Row 5 can also be removed, since the data it contains has been captured as the column names, and row 6 can be removed as it contains demographic information pertaining to the city of Toronto as a whole. Additionally, the TSNS2020 feature is a census data designation adn can also be removed.
+
+```{r}
+NeighbourhoodDemographics = as.data.frame(t(demographics), stringsAsFactors = FALSE)
+colnames(NeighbourhoodDemographics) <- as.character(unlist(NeighbourhoodDemographics[5,]))
+NeighbourhoodDemographics <- NeighbourhoodDemographics[-c(1,2,3,4,5,6),-2]
+```
+# Now we need to convert the features mislabelled as factors into numeric values
+```{r}
+
+#Remove Commas Function
+#This function finds and removes commas from character strings.
+removeCommas<-function(x){
+  x<-(gsub("\\,", "", x))
+}
+#Remove Percent Function
+#This function finds and removes percent signs from character strings.
+removePercents<-function(x){
+  x<-(gsub("\\%", "", x))
+}
+
+for (i in 1:ncol(NeighbourhoodDemographics)) {
+NeighbourhoodDemographics[, i] <- removePercents(NeighbourhoodDemographics[, i])
+NeighbourhoodDemographics[, i] <- removeCommas(NeighbourhoodDemographics[, i])
+NeighbourhoodDemographics[, i] <- as.numeric(NeighbourhoodDemographics[, i])
+}
+str(NeighbourhoodDemographics)
+```
+# Now we can merge our two dataframes
+```{r}
+NeighbourhoodCrimeDemographics <- merge(NeighbourhoodCrime, NeighbourhoodDemographics, by.x=c("Hood_ID"), by.y=c("Neighbourhood Number"))
+```
+#Time to add in the relevant information related to the Supervised Injection Services
+```{r}
+SISData = read.csv('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/NeighbourhoodSISData.csv', header = TRUE)
+SISData$ProximityToSIS <- ordered(SISData$ProximityToSIS, levels = c("Contains SIS", "Adjacent to SIS", "Not Adjacent to SIS"))
+
+NeighbourhoodCrimeDemographics <- merge(NeighbourhoodCrimeDemographics, SISData, by.x=c("Hood_ID"), by.y=c("Hood_ID"))
+```
+# Taking a preliminary look at the combined data
+
+```{r}
+head(NeighbourhoodCrimeDemographics)
+summary(NeighbourhoodCrimeDemographics)
+str(NeighbourhoodCrimeDemographics)
+sum(is.na(NeighbourhoodCrimeDemographics))
+prod(dim(NeighbourhoodCrimeDemographics))
+sum(is.na(NeighbourhoodCrimeDemographics))/prod(dim(NeighbourhoodCrimeDemographics)) #The ratio of NAs to non NAs in the dataframe
+sum(is.null(NeighbourhoodCrimeDemographics))
+sum(complete.cases(NeighbourhoodCrimeDemographics))
+
+```
+#We can immediately remove the first three columns, as they are unique identifiers. We can also remove the information relating to neighbourhood geometry in columns 60-62, and the non predictive information in column 63. Finally, column 5 "Population" and column 64 "2016 Population" are duplicates, so I will remove column 5.
+```{r}
+NeighbourhoodCrimeDemographics <- NeighbourhoodCrimeDemographics[,-c(1,2,3,5,60,61,62,63)]
+```
+#There are no null values, but there are 7840 NA values. There are in fact no complete cases, which is fine since we don't want to eliminate any observations, as each represents a single neighbourhood in the city. Instead, we need to locate the features that contain the majority of the NAs and see if we can either interpolate some values or do without them.
+```{r}
+sapply(NeighbourhoodCrimeDemographics, function(x) sum(is.na(x)))
+```
+#Based on where the NA values are located (in a total of 56 columns), and comparing the results of the function above to the raw data, we can see that the original census data for certain features, most notably features related to median household income, were never given for individual neighbourhoods, only for the city of Toronto as a whole. As such, these features do not provide any relevant information for our purposes and can be removed.
+```{r}
+RelevantFeatures <- sapply(NeighbourhoodCrimeDemographics, function(x) !any(is.na(x)))
+NeighbourhoodCrimeDemographics <- NeighbourhoodCrimeDemographics[, RelevantFeatures]
+sum(is.na(NeighbourhoodCrimeDemographics)) #Last check for NA values
+sum(is.na(NeighbourhoodCrimeDemographics))/prod(dim(NeighbourhoodCrimeDemographics)) #Once more, the ratio of NAs to non NAs in the dataframe
+```
+#Building the Neighbourhood Polygons to find the centroids, still working on this to add in the shortest linear distance to an SIS as a feature
+```{r}
+#neighbourhoodPolygonsX = read.csv('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/NeighbourhoodPolygonsX.csv', header = TRUE, stringsAsFactors = FALSE)
+#neighbourhoodPolygonsY = read.csv('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/NeighbourhoodPolygonsY.csv', header = TRUE, stringsAsFactors = FALSE)
+#neighbourhoodPolygonCoords <- list(c())
+#neighbourhoodPolygon <- list(c())
+#neighbourhoodPolygons <- list(c())
+#neighbourhoodSpatialPolygons <- list(c())
+#for (i in 1:ncol(neighbourhoodPolygonsX)) {
+#neighbourhoodPolygonCoords[[i]] <- cbind(neighbourhoodPolygonsX[,i],neighbourhoodPolygonsY[,i])
+#neighbourhoodPolygon[[i]] <- Polygon(neighbourhoodPolygonCoords[i])
+#neighbourhoodPolygons[[i]] <- Polygons(list(neighbourhoodPolygon[i]),i)
+#neighbourhoodSpatialPolygons[[i]] <- SpatialPolygons(list(neighbourhoodPolygons[i]))
+
+#}
+#Stores each list of coordinates as a 2-column matrix in a list named 'neighbourhoodPolygonCoords'
+#p = Polygon(xym)
+#ps = Polygons(list(p),1)
+#sps = SpatialPolygons(list(ps))
+#plot(sps)
+
+#To find linear distance from the centre of each neighbourhood to the nearest SIS, first we need to find the centroid of the polygons that represent each neighbourhood.
+#hoods <- readShapePoly(system.file("/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/NEIGHBORHOODS_WGS84_2.shp", package="maptools")[1], proj4string=CRS("+proj=longlat +ellps=clrk66"))
+#centroids <- gCentroid
+```
+
+#Feature Selection
+
+#With such a large number of features stemming from the Census data, we need to look at the correlation between a neighbourhood's aggregate total crime rate and demographic information. We can choose a reasonable cut off, so that any feature that does not meet the threshold of correlation, say a cor value of 0.3, would not be included.
+
+#First, we must calculate the aggregate total crime rate for each neighbourhood and store it as an additional feature in the data frame. There are six types of crime rates currently stored in the dataset, each defined by the source of the dataset as the numbers of crimes of the corresponding type per 100,000 population. We can sum these features for each observation in order to obtain the total crime rate for a neighbourhood in terms of major crime indicators.
+```{r}
+NeighbourhoodCrimeDemographics$AggregateCrimeRate2019 <- NeighbourhoodCrimeDemographics$Assault_Rate_2019 + NeighbourhoodCrimeDemographics$AutoTheft_Rate_2019 + NeighbourhoodCrimeDemographics$BreakandEnter_Rate_2019 + NeighbourhoodCrimeDemographics$Homicide_Rate_2019 + NeighbourhoodCrimeDemographics$Robbery_Rate_2019 + NeighbourhoodCrimeDemographics$TheftOver_Rate_2019
+
+correlationsPearson = cor(NeighbourhoodCrimeDemographics[-c(1,2380,2381,2382)], NeighbourhoodCrimeDemographics[2382]) #here we are excluding the first and final features ('Neighbourhood' and 'AggregateCrimeRate2019' itself) from the correlation calculation, as well as the non numerical data regarding proximity to an SIS and using Pearson correlation by default.
+hist(correlationsPearson, breaks = 100)
+correlationsPearson[is.na(correlationsPearson)] <- 0 #To remove the NAs stemming from columns with only 0 values.
+```
+#From the histogram, we can see that choosing a correlation of roughly 0.3 should greatly reduce the number of features in our dataset without significant impact. We can then apply some more sophisticated feature selection techniques to those features that remain.
+```{r}
+correlationsPearson = c(1, correlationsPearson, 1, 1, 1) #here we are adding '1's to the correlations calculations so that when it is used for rough feature selection 'Neighbourhood', 'ContainsSIS', 'ProximityToSIS' , and 'AggregateCrimeRate' itself are included
+
+NeighbourhoodCrimeDemographicsRoughPearson <- as.data.frame( NeighbourhoodCrimeDemographics[, correlationsPearson > 0.3])
+
+str(NeighbourhoodCrimeDemographicsRoughPearson)
+summary(NeighbourhoodCrimeDemographicsRoughPearson)
+
+#Now to do it all again with Spearman, since the numerical data is not necessarily continuous, and this will be less sensitive to outliers.
+
+correlationsSpearman = cor(NeighbourhoodCrimeDemographics[-c(1,2380,2381,2382)], NeighbourhoodCrimeDemographics[2382], method = "spearman") #here we are excluding the first and final features ('Neighbourhood' and 'AggregateCrimeRate2019' itself) from the correlation calculation, and using Pearson correlation by default.
+hist(correlationsSpearman, breaks = 100)
+correlationsSpearman[is.na(correlationsSpearman)] <- 0 #To remove the NAs stemming from columns with only 0 values.
+```
+#Again, from the histogram, we can see that choosing a correlation of roughly 0.3 should greatly reduce the number of features in our dataset without significant impact. We can then apply some more sophisticated feature selection techniques to those features that remain.
+```{r}
+correlationsSpearman = c(1, correlationsSpearman, 1, 1, 1) #here we are adding two '1's to the correlations calculations so that when it is used for rough feature selection 'Neighbourhood', 'ContainsSIS', 'ProximityToSIS' , and 'AggregateCrimeRate' itself are included.
+
+NeighbourhoodCrimeDemographicsRoughSpearman <- as.data.frame( NeighbourhoodCrimeDemographics[, correlationsSpearman > 0.3])
+
+str(NeighbourhoodCrimeDemographicsRoughSpearman)
+summary(NeighbourhoodCrimeDemographicsRoughSpearman)
+
+comparedf(NeighbourhoodCrimeDemographicsRoughPearson, NeighbourhoodCrimeDemographicsRoughSpearman)
+summary(comparedf(NeighbourhoodCrimeDemographicsRoughPearson, NeighbourhoodCrimeDemographicsRoughSpearman))
+#This shows us that the two dataframes produced in this way have 86 variables in common, with the other 69, and 77 variables respectively only in one of the dataframes.
+```
+#Now to progress to more sophisticated feature selection techniques, we have two main options: Filter-based techniques and Wrapper-based techniques. For this dataset, since we have already used a much simplified version of correlation-based feature selection, we will use information gain feature selection (from the FSelector package) as our filter-based technique. We will also try a Stepwise Regression (Both Directions) approach to feature selection (from the stats package) as a wrapper-based technique.
+
+```{r}
+infoGain <- information_gain(AggregateCrimeRate2019∼., NeighbourhoodCrimeDemographics)
+
+null.model = glm(AggregateCrimeRate2019∼1, data = NeighbourhoodCrimeDemographics)
+full.model = glm(AggregateCrimeRate2019∼., data = NeighbourhoodCrimeDemographics)
+step(null.model, scope = list(upper = full.model), data = NeighbourhoodCrimeDemographics, direction = "both")
+
+
+```
+#Partitioning the data
+
+#Although the data may appear to be potentially time dependent, given that the crime rates for different years are variables, the class variable itself is the most far in the future, so there is no danger of using future data to predict the past. As such, we can use cross validation and not the sliding window technique.
+```{r}
+set.seed(10)
+index = sample(nrow(NeighbourhoodCrimeDemographicsRoughSpearman), 0.7 * nrow(NeighbourhoodCrimeDemographicsRoughSpearman))
+train = NeighbourhoodCrimeDemographicsRoughSpearman[index,]
+test = NeighbourhoodCrimeDemographicsRoughSpearman[-index,]
+```
+#Linear
+```{r}
+linear_model = lm(AggregateCrimeRate2019~., data = train)
+summary(linear_model)
+varImp(linear_model)
+plot(linear_model)
+```
+
+#Decision Tree
+```{r}
+decision_tree_model = rpart(AggregateCrimeRate2019~., data = train)
+plot(decision_tree_model)
+```
+
+#Random Forest
+```{r}
+random_forest_model = randomForest(AggregateCrimeRate2019~., data = train)
+```
+#Support Vector Machine
+```{r}
+svm_model = svm(AggregateCrimeRate2019~., data = train)
+```
+
+#Benchmarking classifiers
+
+#The RMSE is one of the most common ways to compare the results obtains by various models, that attempts to minimize residual error. In the specific case of comparing demographic data to Crime rates, I believe it should be most important to minimize the likelihood of false positives, as false negatives have the greatest potential to cause unintentional stigma related to a demographic factor.
+```{r}
+RMSE = function (x, y) return(sqrt(mean((x - y)^2))) #Function for comparing results from different classifiers
+
+linear_prediction  = predict(linear_model, test)
+RMSE(linear_prediction, test$AggregateCrimeRate2019)
+
+decision_tree_prediction = predict(decision_tree_model, test)
+RMSE(decision_tree_prediction, test)
+
+random_forest_prediction = predict(random_forest_model, test)
+RMSE(decision_tree_prediction, test)
+
+svm_prediction = predict(svm_model, test)
+RMSE(decision_tree_prediction, test)
+```
