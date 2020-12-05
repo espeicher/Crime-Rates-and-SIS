@@ -1,0 +1,422 @@
+---
+title: "Toronto Crime Rates and SIS"
+author: "Edward Speicher"
+date: "17/10/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data Preparation
+
+```{r}
+#install.packages('rgdal') #for reading shapefiles
+#install.packages('rgeos') #for calculating polygon centroids
+#install.packages('stringr') #for extracting numeric data in character strings
+#install.packages('geosphere') #for calculating distances using lat,long coords
+#install.packages('arsenal') #for comparing two data.frames
+#install.packages('FSelectorRcpp') #for feature selection, notably the information_gain function
+#install.packages('caret') #for feature selection
+#install.packages('randomForest') #for model building
+#install.packages('e1071') #for model building
+library(rgdal)
+library(rgeos)
+library(stringr)
+library(geosphere)
+library(arsenal)
+library(FSelectorRcpp)
+library(rpart)
+library(caret)
+library(randomForest)
+library(e1071)
+
+setwd('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/')
+
+demographics = read.csv('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/neighbourhood-profiles-2016-csv.csv', header = TRUE, stringsAsFactors = FALSE)
+
+NeighbourhoodCrime = read.csv('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/Neighbourhood Crime Rates.csv', header = TRUE)
+
+```
+# The data in the demographic profiles dataframe needs to be transposed before it can be combined with the crime rate data based on the Neighbourhood ID. We can then remove the rows (1-4) pertaining to the original source of the data fields in the original dataframe. Row 5 can also be removed, since the data it contains has been captured as the column names, and row 6 can be removed as it contains demographic information pertaining to the city of Toronto as a whole. Additionally, the TSNS2020 feature is a census data designation and can also be removed.
+
+```{r}
+NeighbourhoodDemographics = as.data.frame(t(demographics), stringsAsFactors = FALSE)
+colnames(NeighbourhoodDemographics) <- as.character(unlist(NeighbourhoodDemographics[5,]))
+NeighbourhoodDemographics <- NeighbourhoodDemographics[-c(1,2,3,4,5,6),-2]
+```
+# Now we need to convert the features mislabelled as factors into numeric values
+```{r}
+
+#Remove Commas Function
+#This function finds and removes commas from character strings.
+removeCommas<-function(x){
+  x<-(gsub("\\,", "", x))
+}
+#Remove Percent Function
+#This function finds and removes percent signs from character strings.
+removePercents<-function(x){
+  x<-(gsub("\\%", "", x))
+}
+
+for (i in 1:ncol(NeighbourhoodDemographics)) {
+NeighbourhoodDemographics[, i] <- removePercents(NeighbourhoodDemographics[, i])
+NeighbourhoodDemographics[, i] <- removeCommas(NeighbourhoodDemographics[, i])
+NeighbourhoodDemographics[, i] <- as.numeric(NeighbourhoodDemographics[, i])
+}
+str(NeighbourhoodDemographics)
+```
+# Now we can merge our two dataframes
+```{r}
+NeighbourhoodCrimeDemographics <- merge(NeighbourhoodCrime, NeighbourhoodDemographics, by.x=c("Hood_ID"), by.y=c("Neighbourhood Number"))
+```
+#Time to add in the relevant information related to the Supervised Injection Services
+```{r}
+SISData = read.csv('/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data/NeighbourhoodSISData.csv', header = TRUE)
+SISData$ProximityToSIS <- ordered(SISData$ProximityToSIS, levels = c("Contains SIS", "Adjacent to SIS", "Not Adjacent to SIS"))
+
+NeighbourhoodCrimeDemographics <- merge(NeighbourhoodCrimeDemographics, SISData, by.x=c("Hood_ID"), by.y=c("Hood_ID"))
+```
+#To find linear distance from the centre of each neighbourhood to the nearest SIS, first we need to find the centroid of the polygons that represent each neighbourhood.
+```{r}
+neighbourhoods <- readOGR(dsn="/Users/Edward/Documents/Learning/CIND 820/Data/Raw Data",layer="Neighbourhoods")
+
+centroids <- gCentroid(neighbourhoods, byid=TRUE)
+
+NeighbourhoodDistances <- data.frame(neighbourhoods$FIELD_7, centroids@coords, stringsAsFactors = FALSE)
+
+#Now to coerce the neighbourhood ID out of FIELD_7
+
+NeighbourhoodDistances$neighbourhoods.FIELD_7 <- as.character(NeighbourhoodDistances$neighbourhoods.FIELD_7)
+
+regexp <- "[[:digit:]]+"
+
+NeighbourhoodDistances$neighbourhoods.FIELD_7 <-as.numeric(str_extract(NeighbourhoodDistances$neighbourhoods.FIELD_7, regexp))
+
+#The coordinates of the four SIS locations in Toronto that began operating during the time period covered by the data in the dataset. SIS1 is The Works (Toronto Public Health) which began operating in October 2018, SIS2 is South Riverdale CHC which began operating in November 2018, SIS3 is Fred Victor Centre which began operating in February 2019, and SIS4 is Parkdale Queen West CHC which began operating in March 2019.
+
+SIS1 <- c(-79.37935554490983,43.65669868545251)
+
+SIS2 <- c(-79.33910797374507,43.661272050976656)
+  
+SIS3 <- c(-79.3727779602514,43.6537538308498)
+
+SIS4 <- c(-79.4042272025809,43.64677510289168)
+
+#Calculating the linear distances
+
+NeighbourhoodDistances$distance1 <- distm(centroids , SIS1, fun = distHaversine)
+
+NeighbourhoodDistances$distance2 <- distm(centroids , SIS2, fun = distHaversine)
+
+NeighbourhoodDistances$distance3 <- distm(centroids , SIS3, fun = distHaversine)
+
+NeighbourhoodDistances$distance4 <- distm(centroids , SIS4, fun = distHaversine)
+
+NeighbourhoodDistances$SISminDistance <- pmin(NeighbourhoodDistances$distance1, NeighbourhoodDistances$distance2, NeighbourhoodDistances$distance3, NeighbourhoodDistances$distance4)
+
+#Now we can move the relevant minimum distance into a seperate dataframe to merge with our larger dataset.
+
+NeighbourhoodDistance <- NeighbourhoodDistances[,-c(2,3,4,5,6,7)]
+
+NeighbourhoodCrimeDemographics <- merge(NeighbourhoodCrimeDemographics, NeighbourhoodDistance, by.x=c("Hood_ID"), by.y=c("neighbourhoods.FIELD_7"))
+
+#We now have the minimum distance (in metres) from each neighbourhood's centre point to the closest SIS operating during the time in question
+```
+# Taking a preliminary look at the combined data
+```{r}
+head(NeighbourhoodCrimeDemographics)
+summary(NeighbourhoodCrimeDemographics)
+str(NeighbourhoodCrimeDemographics)
+sum(is.na(NeighbourhoodCrimeDemographics))
+prod(dim(NeighbourhoodCrimeDemographics))
+sum(is.na(NeighbourhoodCrimeDemographics))/prod(dim(NeighbourhoodCrimeDemographics)) #The ratio of NAs to non NAs in the dataframe
+sum(is.null(NeighbourhoodCrimeDemographics))
+sum(complete.cases(NeighbourhoodCrimeDemographics))
+
+```
+#We can immediately remove the first three columns, as they are unique identifiers. We can also remove the information relating to neighbourhood geometry in columns 60-62, and the non predictive information in column 63. Finally, column 5 "Population" and column 64 "2016 Population" are duplicates, so I will remove column 5.
+```{r}
+NeighbourhoodCrimeDemographics <- NeighbourhoodCrimeDemographics[,-c(1,2,3,5,60,61,62)]
+```
+#There are no null values, but there are 7840 NA values. There are in fact no complete cases, which is fine since we don't want to eliminate any observations, as each represents a single neighbourhood in the city. Instead, we need to locate the features that contain the majority of the NAs and see if we can either interpolate some values or do without them.
+```{r}
+sapply(NeighbourhoodCrimeDemographics, function(x) sum(is.na(x)))
+```
+#Based on where the NA values are located (in a total of 56 columns), and comparing the results of the function above to the raw data, we can see that the original census data for certain features, most notably features related to median household income, were never given for individual neighbourhoods, only for the city of Toronto as a whole. As such, these features do not provide any relevant information for our purposes and can be removed.
+```{r}
+RelevantFeatures <- sapply(NeighbourhoodCrimeDemographics, function(x) !any(is.na(x)))
+NeighbourhoodCrimeDemographics <- NeighbourhoodCrimeDemographics[, RelevantFeatures]
+sum(is.na(NeighbourhoodCrimeDemographics)) #Last check for NA values
+sum(is.na(NeighbourhoodCrimeDemographics))/prod(dim(NeighbourhoodCrimeDemographics)) #Once more, the ratio of NAs to non NAs in the dataframe
+```
+#Outlier Detection
+```{r}
+#out1 <- boxplot.stats(NeighbourhoodCrimeDemographics$Assault_2014)$out
+
+```
+#Finding the Annual Change in Crime Rate
+```{r}
+#First, we must calculate the aggregate total crime rate for each neighbourhood for 2019 and store it as an additional feature in the data frame. There are six types of crime rates currently stored in the dataset, each defined by the source of the dataset as the numbers of crimes of the corresponding type per 100,000 population. We can sum these features for each observation in order to obtain the total crime rate for a neighbourhood in terms of major crime indicators.
+
+NeighbourhoodCrimeDemographics$AggregateCrimeRate2019 <- NeighbourhoodCrimeDemographics$Assault_Rate_2019 + NeighbourhoodCrimeDemographics$AutoTheft_Rate_2019 + NeighbourhoodCrimeDemographics$BreakandEnter_Rate_2019 + NeighbourhoodCrimeDemographics$Homicide_Rate_2019 + NeighbourhoodCrimeDemographics$Robbery_Rate_2019 + NeighbourhoodCrimeDemographics$TheftOver_Rate_2019
+
+#We are given the crime rates per 100,000 people for the year 2019, but not for other years. If we wish to investigate the effect of the presence of an SIS on the crime rate in an area, we must first calculate the aggregate crime rates for multiple calendar years, and in fact calculate the change in crime rate per 100,000 people in each neighbourhood. Further to this, we are actually looking to investigate the change in the change in crime rate for those areas where SIS began operating to detect if there is a significant difference.
+
+NeighbourhoodCrimeDemographics$AggregateCrimeRate2014 <- (NeighbourhoodCrimeDemographics$Assault_2014/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$AutoTheft_2014/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$BreakandEnter_2014/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$Homicide_2014/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$Robbery_2014/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$TheftOver_2014/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000))
+
+NeighbourhoodCrimeDemographics$AggregateCrimeRate2015 <- (NeighbourhoodCrimeDemographics$Assault_2015/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$AutoTheft_2015/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$BreakandEnter_2015/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$Homicide_2015/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$Robbery_2015/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$TheftOver_2015/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000))
+
+NeighbourhoodCrimeDemographics$AggregateCrimeRate2016 <- (NeighbourhoodCrimeDemographics$Assault_2016/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$AutoTheft_2016/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$BreakandEnter_2016/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$Homicide_2016/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$Robbery_2016/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$TheftOver_2016/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000))
+
+NeighbourhoodCrimeDemographics$AggregateCrimeRate2017 <- (NeighbourhoodCrimeDemographics$Assault_2017/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$AutoTheft_2017/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$BreakandEnter_2017/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$Homicide_2017/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$Robbery_2017/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$TheftOver_2017/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000))
+
+NeighbourhoodCrimeDemographics$AggregateCrimeRate2018 <- (NeighbourhoodCrimeDemographics$Assault_2018/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$AutoTheft_2018/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$BreakandEnter_2018/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$Homicide_2018/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$Robbery_2018/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000)) + (NeighbourhoodCrimeDemographics$TheftOver_2018/(NeighbourhoodCrimeDemographics$`Population, 2016`/100000))
+
+#Now we compute the year to year changes in aggregate crime rates
+
+NeighbourhoodCrimeDemographics$ChangeInCrime20142015 <- NeighbourhoodCrimeDemographics$AggregateCrimeRate2015 - NeighbourhoodCrimeDemographics$AggregateCrimeRate2014
+
+NeighbourhoodCrimeDemographics$ChangeInCrime20152016 <- NeighbourhoodCrimeDemographics$AggregateCrimeRate2016 - NeighbourhoodCrimeDemographics$AggregateCrimeRate2015
+
+NeighbourhoodCrimeDemographics$ChangeInCrime20162017 <- NeighbourhoodCrimeDemographics$AggregateCrimeRate2017 - NeighbourhoodCrimeDemographics$AggregateCrimeRate2016
+
+NeighbourhoodCrimeDemographics$ChangeInCrime20172018 <- NeighbourhoodCrimeDemographics$AggregateCrimeRate2018 - NeighbourhoodCrimeDemographics$AggregateCrimeRate2017
+
+NeighbourhoodCrimeDemographics$ChangeInCrime20182019 <- NeighbourhoodCrimeDemographics$AggregateCrimeRate2019 - NeighbourhoodCrimeDemographics$AggregateCrimeRate2018
+
+```
+#Answering our first research question
+```{r}
+#To investigate the potential link between an operational SIS and a change in crime rate, we can look at the problem two ways:
+
+#First, compare the change in aggregate crime rate from 2018 to 2019 for neighbourhoods containing an operational SIS to the change in crime rate for other neighbourhoods in the city for the same period. This is to find if the change that year was unusual for the city.
+
+#Second, compare the change in aggregate crime rate from 2018 to 2019 in those neighbourhoods that contained an operational SIS during that period to the changes in aggregate crime rate for other years on record for that same neighbourhood. This is to find if the change that year was unusual for the neighbourhood.
+
+SIS <- NeighbourhoodCrimeDemographics[NeighbourhoodCrimeDemographics[ ,2381] == TRUE, c(1,2390,2391,2392,2393,2394)]
+NoSIS <- NeighbourhoodCrimeDemographics[NeighbourhoodCrimeDemographics[ ,2381] == FALSE, c(1,2390,2391,2392,2393,2394)]
+
+#citywide comparison
+
+hist(SIS$ChangeInCrime20182019)
+shapiro.test(SIS$ChangeInCrime20182019)
+hist(NoSIS$ChangeInCrime20182019)
+shapiro.test(NoSIS$ChangeInCrime20182019)
+
+#Although the data for change in crime rate appears almost normally distributed in the histograms, the shapiro-wilk normality test for the change in crime rate in the neighbourhoods without an operational SIS reveals that this is not the case. That being said, even in the case of the neighbourhoods that contain an SIS we cannot draw too many conclusions from such a test due to the very small sample size we are working with.
+
+#Though this may be because of such a small sample size, and more data may eventually show that there is a trend towards the normal distribution. However, since changes in crime rate can depend on policing procedures, economics, government policy, etc. we cannot assume it would be so, and so must use a non-parametric test.
+
+#In cases such as these, it is best to be safe and use a non-parametric test in any case. As the two sets of neighbourhoods are mutually-exclusive, we will use the Wilcoxon Rank Sum test to compare two independent samples. The test will be two sided, as we are looking for any difference in the change in crime rate.
+
+wilcox.test(SIS$ChangeInCrime20182019, NoSIS$ChangeInCrime20182019)
+       
+#With a p-value of 0.05978, we cannot reject the null hypothesis, that there is no difference between the two groups. Therefore, we conclude that the opening of an SIS in a particular neighbourhood in late 2018/early 2019 did not significantly influence the change in crime in that neighbourhood as compared to the change in crime in the rest of the city of Toronto.
+
+#year on year comparisons
+
+hist(t(as.matrix(SIS[1,2:5])))
+shapiro.test(t(as.matrix(SIS[1,2:5])))
+
+#The qq-plot also shows the distribution may be normal
+#qqnorm(t(as.matrix(SIS[1,2:5])))
+#qqline(t(as.matrix(SIS[1,2:5])))
+
+hist(t(as.matrix(SIS[2,2:5])))
+shapiro.test(t(as.matrix(SIS[2,2:5])))
+hist(t(as.matrix(SIS[3,2:5])))
+shapiro.test(t(as.matrix(SIS[3,2:5])))
+hist(t(as.matrix(SIS[4,2:5])))
+shapiro.test(t(as.matrix(SIS[4,2:5])))
+
+#we cannot draw too many conclusions from such a test for our year on year comparisons, due to the very small sample sizes we are working with. However, we can use a normal distribution for each neighbourhood's annual change in crime rate over the time period from 2014-2019 and determine if the reported change in crime rate for the year after an SIS began operating within the neighbourhoods falls within a 95% confidence interval of the sample of years reported. In other words, if there is less than a 5% probability that the 2018-2019 change in crime rate falls within the normal curve of the remainder of the recorded changes in crime rate, we can be 95% confident that the recorded change in crime rate does not represent a statistically significant departure from established observations.
+
+pnorm(SIS[1,6],mean = mean(t(as.matrix(SIS[1,2:5]))),sd = sd(t(as.matrix(SIS[1,2:5]))))
+pnorm(SIS[2,6],mean = mean(t(as.matrix(SIS[2,2:5]))),sd = sd(t(as.matrix(SIS[2,2:5]))))
+pnorm(SIS[3,6],mean = mean(t(as.matrix(SIS[3,2:5]))),sd = sd(t(as.matrix(SIS[3,2:5]))))
+pnorm(SIS[4,6],mean = mean(t(as.matrix(SIS[4,2:5]))),sd = sd(t(as.matrix(SIS[4,2:5]))))
+
+#Based on the calculated probabilities above, we can state that none of the neighbourhoods with an operational SIS reported a change in crime rate that represents a statistically significant departure from established observations for the neighbourhood in previous years.
+```
+#Answering our second research question
+
+#Given the large dataset of demographic factors that we have, is it possible to build a model that predicts the change in future crime rate?
+
+#Feature Selection
+
+#With such a large number of features stemming from the Census data, we need to look at a number of ways to potentially narrow in on the important factors. We can begin with simple Pearson and Spearman correlations between change in crime rate and demographic information provided by the 2016 Census. We can choose a reasonable cut off, so that any feature that does not meet the threshold of correlation, say a cor value of 0.2, would not be included.
+```{r}
+#Function to normalize numeric vectors
+normalize <- function(x) {
+               return ((x - min(x)) / (max(x) - min(x)))
+}
+
+#Normalize any numeric fields that aren't counts (and therefore all have the same scale)
+NeighbourhoodCrimeDemographics[, 2383] <- normalize(NeighbourhoodCrimeDemographics[, 2383])
+
+#remove the data that was used to generate the class feature so that we can attempt to model it instead of calculating it
+NeighbourhoodCrimeDemographics <- NeighbourhoodCrimeDemographics[,-c(1,7,8,9,10,16,17,18,19,25,26,27,28,34,35,36,37,43,44,45,46,52,53,54,55,2384)]
+                                                 
+correlationsPearson = cor(NeighbourhoodCrimeDemographics[-c(2356,2357,2368)], NeighbourhoodCrimeDemographics[2368]) #here we are excluding the non numerical data regarding proximity to an SIS and using Pearson correlation by default.
+hist(correlationsPearson, breaks = 100)
+correlationsPearson[is.na(correlationsPearson)] <- 0 #To remove the NAs stemming from columns with only 0 values.
+```
+#From the histogram, we can see that choosing a correlation of roughly 0.2 should greatly reduce the number of features in our dataset without significant impact. We can then apply some more sophisticated feature selection techniques to compare. We use the absolute value of the correlation coefficient calculated, so that stronger but negative correlations, which still may prove helpful, are not excluded.
+```{r}
+correlationsPearson = c(correlationsPearson[1:2355], 1, 1,correlationsPearson[2356:2365], 1) #here we are adding '1's to the correlations calculations so that when it is used for rough feature selection, 'ContainsSIS', 'ProximityToSIS' , and 'ChangeInCrime20182019' itself are included
+
+NeighbourhoodCrimeDemographicsRoughPearson <- as.data.frame( NeighbourhoodCrimeDemographics[, abs(correlationsPearson) > 0.2])
+
+str(NeighbourhoodCrimeDemographicsRoughPearson)
+summary(NeighbourhoodCrimeDemographicsRoughPearson)
+
+#Now to do it all again with Spearman, since the numerical data is not necessarily continuous, and this will be less sensitive to outliers.
+
+correlationsSpearman = cor(NeighbourhoodCrimeDemographics[-c(2356,2357,2368)], NeighbourhoodCrimeDemographics[2368], method = "spearman") #here we are excluding 'Neighbourhood' and 'ChangeInCrime20182019' itself from the correlation calculation, as well as the non numerical data regarding proximity to an SIS.
+hist(correlationsSpearman, breaks = 100)
+correlationsSpearman[is.na(correlationsSpearman)] <- 0 #To remove the NAs stemming from columns with only 0 values.
+```
+#Again, from the histogram, we can see that choosing a correlation of roughly 0.2 should greatly reduce the number of features in our dataset without significant impact. Again, we use the absolute value of the correlation coefficient calculated, so that stronger but negative correlations, which still may prove helpful, are not excluded. We can then also apply some more sophisticated feature selection techniques to compare results.
+```{r}
+correlationsSpearman = c(correlationsSpearman[1:2355], 1, 1,correlationsSpearman[2356:2365], 1) #here we are again adding '1's to the correlations calculations so that when it is used for rough feature selection 'ContainsSIS', 'ProximityToSIS' , and 'ChangeInCrime20182019' itself are included.
+
+NeighbourhoodCrimeDemographicsRoughSpearman <- as.data.frame( NeighbourhoodCrimeDemographics[, abs(correlationsSpearman) > 0.2])
+
+str(NeighbourhoodCrimeDemographicsRoughSpearman)
+summary(NeighbourhoodCrimeDemographicsRoughSpearman)
+
+comparedf(NeighbourhoodCrimeDemographicsRoughPearson, NeighbourhoodCrimeDemographicsRoughSpearman)
+summary(comparedf(NeighbourhoodCrimeDemographicsRoughPearson, NeighbourhoodCrimeDemographicsRoughSpearman))
+#This shows us that the two dataframes produced in this way have 13 variables in common, with the other 42, and 27 variables respectively only in one of the dataframes.
+```
+#This gives us some idea of what features we may expect to see result from the more sophisticated techniques. Now to progress to more sophisticated feature selection techniques, we have two main options: Filter-based techniques and Wrapper-based techniques. For this dataset, since we have already used a much simplified version of correlation-based feature selection, we will use information gain feature selection (from the FSelector package) as our filter-based technique. We will also try a Stepwise Regression (Forward) approach to feature selection (from the stats package) as a wrapper-based technique.
+
+```{r}
+infoGain <- information_gain(ChangeInCrime20182019∼., NeighbourhoodCrimeDemographics)
+
+null.model <- glm(ChangeInCrime20182019∼1, data = NeighbourhoodCrimeDemographics)
+full.model <- glm(ChangeInCrime20182019∼., data = NeighbourhoodCrimeDemographics)
+stepwiseModel <- step(null.model, scope = list(upper = full.model), data = NeighbourhoodCrimeDemographics, direction = "forward")
+summary(stepwiseModel)
+coef(stepwiseModel)
+#Based on the majority vote of the feature selection tools utilized, we will include the following features in the construction of our classifier: 'ChangeInCrime20142015', 'ChangeInCrime20152016', 'ChangeInCrime20162017','ChangeInCrime20172018', 'AggregateCrimeRate2014', 'AggregateCrimeRate2015', 'AggregateCrimeRate2016', 'AggregateCrimeRate2017', 'AggregateCrimeRate2018', 'Employment rate (Males)', 'Population, 2016', 'Total income: Aggregate amount ($'000)', 'Knowledge of official languages for the total population excluding institutional residents', 'Persons living alone (per cent)'
+
+```
+#Partitioning the data
+
+#Although the data may appear to be potentially time dependent, given that the crime rates for different years are variables, the class variable itself is the furthest in the future, so there is no danger of using future data to predict the past. Additionally, the observations themselves each represent a geographical area of the city, and as such are not time dependent. Given this, we can use cross validation and not the sliding window technique.
+```{r}
+
+set.seed(10)
+index = sample(nrow(NeighbourhoodCrimeDemographics), 0.7 * nrow(NeighbourhoodCrimeDemographics))
+train = NeighbourhoodCrimeDemographics[index,]
+test = NeighbourhoodCrimeDemographics[-index,]
+
+#Only those features selected
+
+trainSelected = train[,c("ChangeInCrime20142015", "ChangeInCrime20152016", "ChangeInCrime20162017","ChangeInCrime20172018","ChangeInCrime20182019", "AggregateCrimeRate2014", "AggregateCrimeRate2015", "AggregateCrimeRate2016", "AggregateCrimeRate2017", "AggregateCrimeRate2018", "Employment rate (Males)", "Population, 2016", "Total income: Aggregate amount ($'000)", "Knowledge of official languages for the total population excluding institutional residents", "Persons living alone (per cent)")]
+names(trainSelected) <- make.names(names(trainSelected)) #some feature names were classified as illegal
+testSelected = test[,c("ChangeInCrime20142015", "ChangeInCrime20152016", "ChangeInCrime20162017","ChangeInCrime20172018","ChangeInCrime20182019", "AggregateCrimeRate2014", "AggregateCrimeRate2015", "AggregateCrimeRate2016", "AggregateCrimeRate2017", "AggregateCrimeRate2018", "Employment rate (Males)", "Population, 2016", "Total income: Aggregate amount ($'000)", "Knowledge of official languages for the total population excluding institutional residents", "Persons living alone (per cent)")]
+names(testSelected) <- make.names(names(testSelected)) #some feature names were classified as illegal
+```
+#Linear
+```{r}
+linear_model = lm(ChangeInCrime20182019~., data = trainSelected)
+summary(linear_model)
+plot(linear_model)
+```
+
+#Decision Tree
+```{r}
+decision_tree_model = rpart(ChangeInCrime20182019~., data = trainSelected)
+plot(decision_tree_model)
+```
+
+#Random Forest
+```{r}
+random_forest_model = randomForest(ChangeInCrime20182019~., data = trainSelected)
+plot(random_forest_model)
+```
+#Benchmarking classifiers for second research question
+
+#The RMSE is one of the most common ways to compare numeric results obtains by various models, that attempts to minimize residual error.
+```{r}
+
+RMSE = function (predicted, tested) return(sqrt(mean((predicted - tested)^2))) #Function for comparing results from different classifiers
+
+linear_prediction  = predict(linear_model, testSelected)
+RMSE(linear_prediction, testSelected$ChangeInCrime20182019)
+
+decision_tree_prediction = predict(decision_tree_model, testSelected)
+RMSE(decision_tree_prediction, testSelected$ChangeInCrime20182019)
+
+random_forest_prediction = predict(random_forest_model, testSelected)
+RMSE(random_forest_prediction, testSelected$ChangeInCrime20182019)
+
+mean(NeighbourhoodCrimeDemographics$ChangeInCrime20182019)
+sd(NeighbourhoodCrimeDemographics$ChangeInCrime20182019)
+
+#By this measure, the random forest model is our best model for predicting changes in the future crime rate. However, with a RMSE of 213.0448, and the mean of the Change in Crime Rate from 2018-2019 across Toronto Neighbourhoods being 87.7539 with a sd of 202.477, it is a very poor model indeed. As such, the answer to our research question is no, you cannot construct such a model from demographic information and past crime statistics alone. Perhaps a larger historic sample size, or including shifts in demographic information based on multiple census taking might lead to a better model.
+
+#To try and answer a more simplified scenario for research question 3, we can try this again, only this time we are only predicting a binary outcome of whether or not the crime rate will rise or fall.
+
+trainSelected2 <- trainSelected
+testSelected2 <- testSelected
+
+trainSelected2$CrimeRises <- as.factor(ifelse(trainSelected2$ChangeInCrime20182019>0,1,0))
+
+testSelected2$CrimeRises <-as.factor( ifelse(testSelected2$ChangeInCrime20182019>0,1,0))
+
+#Build models
+
+decision_tree_model2 = rpart(CrimeRises~.-ChangeInCrime20182019, method = 'class', data = trainSelected2) #used "ChangeInCrime20182019" to create "CrimeRises" so it needs to be discounted from the model.
+
+nb_model = naiveBayes(CrimeRises~.-ChangeInCrime20182019, data = trainSelected2)
+
+#Test models
+
+#Decision Tree
+
+decision_tree_prediction2 = predict(decision_tree_model2, newdata = testSelected2)
+
+decision_tree_prediction2[, 1] = sapply(decision_tree_prediction2[, 1], function(x) ifelse(x >= 0.5, '1', '0'))
+decision_tree_prediction2 = as.factor(decision_tree_prediction2[, 1])
+
+confusionMatrix(testSelected2$CrimeRises, decision_tree_prediction2)
+decision_tree_p <- precision(testSelected2$CrimeRises, decision_tree_prediction2)
+decision_tree_p
+
+plot(decision_tree_model2)
+text(decision_tree_model2, pretty =0)
+
+#Naive Bayes
+
+nb_prediction = predict(nb_model, testSelected2)
+confusionMatrix(testSelected2$CrimeRises, nb_prediction)
+nb_p <- precision(testSelected2$CrimeRises, nb_prediction)
+nb_p
+
+#What if we train the Naive Bayes model?
+
+nb_model2 = train(CrimeRises~.-ChangeInCrime20182019, data = trainSelected2, method = "nb", trControl = trainControl(method = 'cv', number = 10)) #10-fold cross-validation, will ask to install klar package
+
+nb_model2
+
+nb2_prediction = predict(nb_model2, testSelected2)
+
+confusionMatrix(testSelected2$CrimeRises, nb2_prediction)
+nb2_p <- precision(testSelected2$CrimeRises, nb2_prediction)
+nb2_p
+
+#Kruskal-Wallis test on calssifiers
+
+models <- factor(c('DT','NB','NB2'))
+precision_scores <- as.numeric(c(decision_tree_p,nb_p,nb2_p))
+models.precision_scores <- cbind.data.frame(models, precision_scores)
+
+kruskal.test(precision_scores ~ models, data =models.precision_scores)
+```
